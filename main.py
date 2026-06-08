@@ -2,43 +2,50 @@ import os
 import json
 import base64
 import asyncio
+import audioop
+import httpx
 import websockets
-from fastapi import FastAPI, WebSocket, Request, Form
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
-from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
+from twilio.twiml.voice_response import VoiceResponse, Connect
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY     = os.getenv('OPENAI_API_KEY')
+DEEPGRAM_API_KEY   = os.getenv('DEEPGRAM_API_KEY')
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN  = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE       = os.getenv('TWILIO_PHONE_NUMBER')
 PORT               = int(os.getenv('PORT', 5050))
 PUBLIC_URL         = os.getenv('PUBLIC_URL', '')
 
-VOICE = 'alloy'
+# Word threshold: responses longer than this get summarized
+SUMMARY_WORD_THRESHOLD = 20
+
 END_CALL_COMMANDS = {'end call', 'bye', 'goodbye', 'hang up', 'stop', 'end'}
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
 sessions: dict = {}
 
 app = FastAPI()
+
 
 # ── Health check ───────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
+
 # ── SMS Webhook (/sms) ─────────────────────────────────────────────────────────
 @app.api_route("/sms", methods=["GET", "POST"])
 async def handle_sms(request: Request):
-    form = await request.form()
+    form        = await request.form()
     from_number = form.get('From', '').strip()
     body        = form.get('Body', '').strip()
     body_lower  = body.lower()
@@ -58,9 +65,9 @@ async def handle_sms(request: Request):
             resp.message("Call ended.")
             return HTMLResponse(content=str(resp), media_type="application/xml")
 
-        openai_ws = session.get('openai_ws')
-        if openai_ws and openai_ws.state.name == 'OPEN':
-            asyncio.create_task(inject_text_as_speech(openai_ws, body))
+        tts_queue = session.get('tts_queue')
+        if tts_queue is not None:
+            await tts_queue.put(body)
         else:
             resp.message("(Could not relay message — call may have ended.)")
 
@@ -68,24 +75,23 @@ async def handle_sms(request: Request):
 
     # ── Pending name: user is providing their name ──
     if from_number in sessions and sessions[from_number].get('awaiting_name'):
-        session = sessions[from_number]
-        caller_name = body.strip()
+        session      = sessions[from_number]
+        caller_name  = body.strip()
         voice_number = session['voice_number']
-        session['caller_name'] = caller_name
+        session['caller_name']   = caller_name
         session['awaiting_name'] = False
 
         try:
-            from urllib.parse import quote
             call = twilio_client.calls.create(
                 to=voice_number,
                 from_=TWILIO_PHONE,
-                url=f'{PUBLIC_URL}/voice-connect?sms_from={from_number}&caller_name={quote(caller_name)}',
-                status_callback=f'{PUBLIC_URL}/call-status?sms_from={from_number}',
+                url=f'{PUBLIC_URL}/voice-connect?sms_from={quote(from_number)}&caller_name={quote(caller_name)}',
+                status_callback=f'{PUBLIC_URL}/call-status?sms_from={quote(from_number)}',
                 status_callback_event=['completed', 'failed', 'no-answer', 'busy'],
                 status_callback_method='POST'
             )
             session['call_sid'] = call.sid
-            session['active'] = True
+            session['active']   = True
             resp.message(f"Calling {voice_number}... I'll let you know when they pick up. Start texting to speak. Reply 'end call' to hang up.")
         except Exception as e:
             del sessions[from_number]
@@ -97,21 +103,20 @@ async def handle_sms(request: Request):
     if body_lower.startswith('call '):
         voice_number = body[5:].strip().replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
         if voice_number.startswith('+'):
-            pass  # already in E.164 format
+            pass
         elif voice_number.startswith('1') and len(voice_number) == 11:
             voice_number = '+' + voice_number
         else:
             voice_number = '+1' + voice_number
 
-        # Store pending session and ask for caller name
         sessions[from_number] = {
             'voice_number': voice_number,
-            'call_sid': None,
-            'stream_sid': None,
-            'openai_ws': None,
-            'active': False,
+            'call_sid':     None,
+            'stream_sid':   None,
+            'tts_queue':    None,
+            'active':       False,
             'awaiting_name': True,
-            'caller_name': None
+            'caller_name':  None
         }
         resp.message(
             "We will place your call in a moment. First, enter the name for your "
@@ -137,12 +142,11 @@ async def voice_connect(request: Request):
                 to=sms_from
             )
         except Exception as e:
-            print(f"Error sending connected notification: {e}")
+            print(f"Error sending pickup notification: {e}")
 
-    from urllib.parse import quote
     response = VoiceResponse()
-    connect = Connect()
-    connect.stream(url=f'wss://{request.url.hostname}/media-stream?sms_from={sms_from}&caller_name={quote(caller_name)}')
+    connect  = Connect()
+    connect.stream(url=f'wss://{request.url.hostname}/media-stream?sms_from={quote(sms_from)}&caller_name={quote(caller_name)}')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -150,18 +154,15 @@ async def voice_connect(request: Request):
 # ── Call Status Webhook (/call-status) ────────────────────────────────────────
 @app.api_route("/call-status", methods=["GET", "POST"])
 async def call_status(request: Request):
-    form = await request.form()
+    form        = await request.form()
     sms_from    = request.query_params.get('sms_from', '')
-    call_status = form.get('CallStatus', 'unknown')
+    status      = form.get('CallStatus', 'unknown')
 
     if sms_from and sms_from in sessions:
         sessions[sms_from]['active'] = False
-        openai_ws = sessions[sms_from].get('openai_ws')
-        if openai_ws:
-            try:
-                await openai_ws.close()
-            except Exception:
-                pass
+        tts_queue = sessions[sms_from].get('tts_queue')
+        if tts_queue:
+            await tts_queue.put(None)  # signal shutdown
 
         status_messages = {
             'completed': "Call ended.",
@@ -169,7 +170,7 @@ async def call_status(request: Request):
             'no-answer': "No answer.",
             'failed':    "Call failed.",
         }
-        msg = status_messages.get(call_status, f"Call ended ({call_status}).")
+        msg = status_messages.get(status, f"Call ended ({status}).")
         try:
             twilio_client.messages.create(body=msg, from_=TWILIO_PHONE, to=sms_from)
         except Exception as e:
@@ -186,175 +187,206 @@ async def handle_media_stream(websocket: WebSocket):
     caller_name = websocket.query_params.get('caller_name', 'your caller')
     print(f"Media stream connected for {sms_from} (caller: {caller_name})")
 
+    stream_sid = None
+    tts_queue  = asyncio.Queue()
+
+    if sms_from and sms_from in sessions:
+        sessions[sms_from]['tts_queue'] = tts_queue
+
+    # ── Deepgram STT connection ──
+    dg_url = (
+        "wss://api.deepgram.com/v1/listen"
+        "?model=nova-3"
+        "&encoding=mulaw"
+        "&sample_rate=8000"
+        "&channels=1"
+        "&interim_results=false"
+        "&utterance_end_ms=1200"
+        "&vad_events=true"
+        "&smart_format=true"
+    )
+
     async with websockets.connect(
-        "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
-        additional_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
+        dg_url,
+        additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+    ) as dg_ws:
 
-        await initialize_session(openai_ws)
-
-        if sms_from and sms_from in sessions:
-            sessions[sms_from]['openai_ws'] = openai_ws
-
-        stream_sid = None
-        latest_media_timestamp = 0
-        last_assistant_item = None
-        mark_queue = []
-        response_start_timestamp_twilio = None
-
+        # ── 1. Receive audio from Twilio → forward to Deepgram ──
         async def receive_from_twilio():
-            nonlocal stream_sid, latest_media_timestamp
+            nonlocal stream_sid
             try:
                 async for message in websocket.iter_text():
-                    data = json.loads(message)
-                    if data['event'] == 'media' and openai_ws.state.name == 'OPEN':
-                        latest_media_timestamp = int(data['media']['timestamp'])
-                        await openai_ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": data['media']['payload']
-                        }))
-                    elif data['event'] == 'start':
+                    data  = json.loads(message)
+                    event = data.get('event')
+
+                    if event == 'start':
                         stream_sid = data['start']['streamSid']
                         if sms_from and sms_from in sessions:
                             sessions[sms_from]['stream_sid'] = stream_sid
                         print(f"Stream started: {stream_sid}")
-                        # Play intro message to the voice user
-                        intro = (
-                            f"Hello. I am a voice assistant with WhisperText. "
-                            f"I have {caller_name} on the line for you. "
-                            f"They are communicating via text messages, which I will repeat aloud to you. "
-                            f"I will do my best to record what you say and text it back to them."
-                        )
-                        asyncio.create_task(inject_text_as_speech(openai_ws, intro))
-                    elif data['event'] == 'mark':
-                        if mark_queue:
-                            mark_queue.pop(0)
+                        # Play intro after a short delay to let stream stabilize
+                        asyncio.create_task(play_intro(websocket, stream_sid, caller_name))
+
+                    elif event == 'media':
+                        # Twilio sends mulaw 8kHz — forward directly to Deepgram
+                        audio_bytes = base64.b64decode(data['media']['payload'])
+                        await dg_ws.send(audio_bytes)
+
+                    elif event == 'stop':
+                        print("Twilio stream stopped.")
+                        await dg_ws.send(json.dumps({"type": "CloseStream"}))
+                        break
+
             except WebSocketDisconnect:
                 print("Twilio disconnected.")
-                if openai_ws.state.name == 'OPEN':
-                    await openai_ws.close()
+                try:
+                    await dg_ws.send(json.dumps({"type": "CloseStream"}))
+                except Exception:
+                    pass
 
-        async def send_to_twilio():
-            nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
+        # ── 2. Receive transcripts from Deepgram → summarize if needed → SMS ──
+        async def receive_from_deepgram():
             try:
-                async for openai_message in openai_ws:
-                    response = json.loads(openai_message)
-                    event_type = response.get('type', '')
+                async for message in dg_ws:
+                    data = json.loads(message)
+                    msg_type = data.get('type', '')
 
-                    if event_type == 'response.audio.delta' and response.get('delta'):
-                        audio_payload = base64.b64encode(
-                            base64.b64decode(response['delta'])
-                        ).decode('utf-8')
-                        audio_delta = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": audio_payload}
-                        }
-                        await websocket.send_json(audio_delta)
+                    if msg_type == 'Results':
+                        alt = data.get('channel', {}).get('alternatives', [{}])[0]
+                        transcript = alt.get('transcript', '').strip()
+                        is_final   = data.get('is_final', False)
 
-                        if response_start_timestamp_twilio is None:
-                            response_start_timestamp_twilio = latest_media_timestamp
+                        if transcript and is_final:
+                            word_count = len(transcript.split())
 
-                        if response.get('item_id'):
-                            last_assistant_item = response['item_id']
-
-                        await send_mark(websocket, stream_sid, mark_queue)
-
-                    # Transcription from landline → SMS to text user
-                    if event_type == 'conversation.item.input_audio_transcription.completed':
-                        transcript = response.get('transcript', '').strip()
-                        if transcript and sms_from:
-                            try:
-                                twilio_client.messages.create(
-                                    body=f"📞 {transcript}",
-                                    from_=TWILIO_PHONE,
-                                    to=sms_from
-                                )
-                            except Exception as e:
-                                print(f"Error sending transcript SMS: {e}")
-
-                    if event_type == 'input_audio_buffer.speech_started':
-                        if last_assistant_item and stream_sid:
-                            await handle_speech_started_event(
-                                websocket, openai_ws, stream_sid,
-                                last_assistant_item, response_start_timestamp_twilio,
-                                latest_media_timestamp, mark_queue
-                            )
-                            last_assistant_item = None
-                            response_start_timestamp_twilio = None
+                            if word_count > SUMMARY_WORD_THRESHOLD:
+                                # Summarize long response
+                                summary = await summarize(transcript)
+                                # Text the summary to the text user
+                                if sms_from:
+                                    try:
+                                        twilio_client.messages.create(
+                                            body=f"📞 {summary}",
+                                            from_=TWILIO_PHONE,
+                                            to=sms_from
+                                        )
+                                    except Exception as e:
+                                        print(f"Error sending summary SMS: {e}")
+                                # Read back confirmation to voice user
+                                readback = f"Ok, I'll tell {caller_name}: {summary}"
+                                await tts_queue.put(f"__READBACK__{readback}")
+                            else:
+                                # Short response — pass through as-is
+                                if sms_from:
+                                    try:
+                                        twilio_client.messages.create(
+                                            body=f"📞 {transcript}",
+                                            from_=TWILIO_PHONE,
+                                            to=sms_from
+                                        )
+                                    except Exception as e:
+                                        print(f"Error sending transcript SMS: {e}")
 
             except Exception as e:
-                print(f"Error in send_to_twilio: {e}")
+                print(f"Deepgram receive error: {e}")
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        # ── 3. TTS queue: convert text → Deepgram Aura audio → Twilio ──
+        async def process_tts_queue():
+            while True:
+                text = await tts_queue.get()
+                if text is None:
+                    break  # shutdown signal
+                # Strip internal readback prefix if present
+                if text.startswith("__READBACK__"):
+                    text = text[len("__READBACK__"):]
+                if stream_sid:
+                    await speak_to_twilio(websocket, stream_sid, text)
+
+        await asyncio.gather(
+            receive_from_twilio(),
+            receive_from_deepgram(),
+            process_tts_queue()
+        )
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-async def initialize_session(openai_ws):
-    session_update = {
-        "type": "session.update",
-        "session": {
-            "turn_detection": {"type": "server_vad"},
-            "input_audio_format": "g711_ulaw",
-            "output_audio_format": "g711_ulaw",
-            "input_audio_transcription": {"model": "whisper-1"},
-            "voice": VOICE,
-            "instructions": (
-                "You are a transparent audio relay. Your only job is to convert "
-                "text input to speech and speech input to text. Do not add any "
-                "words, commentary, or responses of your own. Simply relay audio "
-                "as instructed."
-            ),
-            "modalities": ["text", "audio"],
-            "temperature": 0.1,
-        }
+# ── Play intro to voice user ───────────────────────────────────────────────────
+async def play_intro(websocket: WebSocket, stream_sid: str, caller_name: str):
+    await asyncio.sleep(1)  # let stream settle
+    intro = (
+        f"Hello. I am a voice assistant with WhisperText. "
+        f"I have {caller_name} on the line for you. "
+        f"They are communicating via text messages, which I will repeat aloud to you. "
+        f"I will do my best to record what you say and text it back to them."
+    )
+    await speak_to_twilio(websocket, stream_sid, intro)
+
+
+# ── Deepgram Aura TTS → mulaw audio → Twilio ──────────────────────────────────
+async def speak_to_twilio(websocket: WebSocket, stream_sid: str, text: str):
+    """Convert text to speech via Deepgram Aura and stream to Twilio."""
+    url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=linear16&sample_rate=8000"
+    headers = {
+        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Content-Type": "application/json"
     }
-    await openai_ws.send(json.dumps(session_update))
+    payload = {"text": text}
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                audio_chunks = b""
+                async for chunk in response.aiter_bytes(chunk_size=4096):
+                    audio_chunks += chunk
+
+        # Convert linear16 PCM → mulaw 8kHz for Twilio
+        mulaw_audio = audioop.lin2ulaw(audio_chunks, 2)
+
+        # Send in 160-byte chunks (20ms frames at 8kHz mulaw)
+        chunk_size = 160
+        for i in range(0, len(mulaw_audio), chunk_size):
+            chunk = mulaw_audio[i:i + chunk_size]
+            payload = base64.b64encode(chunk).decode('utf-8')
+            await websocket.send_json({
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": payload}
+            })
+            await asyncio.sleep(0.02)  # pace at 20ms per frame
+
+    except Exception as e:
+        print(f"TTS error: {e}")
 
 
-async def inject_text_as_speech(openai_ws, text: str):
-    """Send a text message to OpenAI to be spoken aloud on the call."""
-    message_event = {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}]
-        }
-    }
-    await openai_ws.send(json.dumps(message_event))
-    await openai_ws.send(json.dumps({"type": "response.create"}))
-
-
-async def send_mark(websocket, stream_sid, mark_queue):
-    if stream_sid:
-        mark_event = {
-            "event": "mark",
-            "streamSid": stream_sid,
-            "mark": {"name": "responsePart"}
-        }
-        await websocket.send_json(mark_event)
-        mark_queue.append('responsePart')
-
-
-async def handle_speech_started_event(
-    websocket, openai_ws, stream_sid, last_assistant_item,
-    response_start_timestamp_twilio, latest_media_timestamp, mark_queue
-):
-    if mark_queue and response_start_timestamp_twilio is not None:
-        elapsed = latest_media_timestamp - response_start_timestamp_twilio
-        if last_assistant_item:
-            await openai_ws.send(json.dumps({
-                "type": "conversation.item.truncate",
-                "item_id": last_assistant_item,
-                "content_index": 0,
-                "audio_end_ms": elapsed
-            }))
-        await websocket.send_json({
-            "event": "clear",
-            "streamSid": stream_sid
-        })
-        mark_queue.clear()
+# ── GPT-4o-mini summarizer ─────────────────────────────────────────────────────
+async def summarize(transcript: str) -> str:
+    """Summarize a long transcript using GPT-4o-mini."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a relay assistant. Summarize the following spoken message "
+                                "into one concise sentence suitable for an SMS. Keep it factual and brief. "
+                                "Do not add any commentary or punctuation beyond the summary itself."
+                            )
+                        },
+                        {"role": "user", "content": transcript}
+                    ],
+                    "max_tokens": 80,
+                    "temperature": 0.3
+                }
+            )
+            data = response.json()
+            return data['choices'][0]['message']['content'].strip()
+    except Exception as e:
+        print(f"Summarize error: {e}")
+        return transcript  # fallback: return original if summarization fails
