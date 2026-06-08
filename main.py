@@ -66,8 +66,12 @@ async def handle_sms(request: Request):
         return HTMLResponse(content=str(resp), media_type="application/xml")
 
     if body_lower.startswith('call '):
-        voice_number = body[5:].strip().replace(' ', '')
-        if not voice_number.startswith('+'):
+        voice_number = body[5:].strip().replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        if voice_number.startswith('+'):
+            pass  # already in E.164 format
+        elif voice_number.startswith('1') and len(voice_number) == 11:
+            voice_number = '+' + voice_number
+        else:
             voice_number = '+1' + voice_number
 
         try:
