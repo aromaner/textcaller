@@ -137,7 +137,7 @@ async def voice_connect(request: Request):
     if sms_from:
         try:
             twilio_client.messages.create(
-                body="They picked up! You're connected. Start texting to speak.",
+                body="They picked up! You're connected. Start texting to speak. Reply 'end call' to hang up.",
                 from_=TWILIO_PHONE,
                 to=sms_from
             )
