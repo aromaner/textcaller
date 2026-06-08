@@ -45,7 +45,8 @@ async def handle_sms(request: Request):
 
     resp = MessagingResponse()
 
-    if from_number in sessions and sessions[from_number]['active']:
+    # ── Active call: relay text or end call ──
+    if from_number in sessions and sessions[from_number].get('active'):
         session = sessions[from_number]
 
         if body_lower in END_CALL_COMMANDS:
@@ -65,6 +66,34 @@ async def handle_sms(request: Request):
 
         return HTMLResponse(content=str(resp), media_type="application/xml")
 
+    # ── Pending name: user is providing their name ──
+    if from_number in sessions and sessions[from_number].get('awaiting_name'):
+        session = sessions[from_number]
+        caller_name = body.strip()
+        voice_number = session['voice_number']
+        session['caller_name'] = caller_name
+        session['awaiting_name'] = False
+
+        try:
+            from urllib.parse import quote
+            call = twilio_client.calls.create(
+                to=voice_number,
+                from_=TWILIO_PHONE,
+                url=f'{PUBLIC_URL}/voice-connect?sms_from={from_number}&caller_name={quote(caller_name)}',
+                status_callback=f'{PUBLIC_URL}/call-status?sms_from={from_number}',
+                status_callback_event=['completed', 'failed', 'no-answer', 'busy'],
+                status_callback_method='POST'
+            )
+            session['call_sid'] = call.sid
+            session['active'] = True
+            resp.message(f"Calling {voice_number}... I'll let you know when they pick up. Start texting to speak. Reply 'end call' to hang up.")
+        except Exception as e:
+            del sessions[from_number]
+            resp.message(f"Failed to place call: {e}")
+
+        return HTMLResponse(content=str(resp), media_type="application/xml")
+
+    # ── New call request ──
     if body_lower.startswith('call '):
         voice_number = body[5:].strip().replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
         if voice_number.startswith('+'):
@@ -74,26 +103,20 @@ async def handle_sms(request: Request):
         else:
             voice_number = '+1' + voice_number
 
-        try:
-            call = twilio_client.calls.create(
-                to=voice_number,
-                from_=TWILIO_PHONE,
-                url=f'{PUBLIC_URL}/voice-connect?sms_from={from_number}',
-                status_callback=f'{PUBLIC_URL}/call-status?sms_from={from_number}',
-                status_callback_event=['completed', 'failed', 'no-answer', 'busy'],
-                status_callback_method='POST'
-            )
-            sessions[from_number] = {
-                'voice_number': voice_number,
-                'call_sid': call.sid,
-                'stream_sid': None,
-                'openai_ws': None,
-                'active': True
-            }
-            resp.message(f"Calling {voice_number}... I'll connect you when they pick up. Send any message to speak. Reply 'end call' to hang up.")
-        except Exception as e:
-            resp.message(f"Failed to place call: {e}")
-
+        # Store pending session and ask for caller name
+        sessions[from_number] = {
+            'voice_number': voice_number,
+            'call_sid': None,
+            'stream_sid': None,
+            'openai_ws': None,
+            'active': False,
+            'awaiting_name': True,
+            'caller_name': None
+        }
+        resp.message(
+            "We will place your call in a moment. First, enter the name for your "
+            "voice assistant with WhisperText to use when announcing your call."
+        )
         return HTMLResponse(content=str(resp), media_type="application/xml")
 
     resp.message("No active call. To start one, text: call +1XXXXXXXXXX")
@@ -103,7 +126,8 @@ async def handle_sms(request: Request):
 # ── Voice Connect Webhook (/voice-connect) ────────────────────────────────────
 @app.api_route("/voice-connect", methods=["GET", "POST"])
 async def voice_connect(request: Request):
-    sms_from = request.query_params.get('sms_from', '')
+    sms_from    = request.query_params.get('sms_from', '')
+    caller_name = request.query_params.get('caller_name', 'your caller')
 
     if sms_from:
         try:
@@ -115,9 +139,10 @@ async def voice_connect(request: Request):
         except Exception as e:
             print(f"Error sending connected notification: {e}")
 
+    from urllib.parse import quote
     response = VoiceResponse()
     connect = Connect()
-    connect.stream(url=f'wss://{request.url.hostname}/media-stream?sms_from={sms_from}')
+    connect.stream(url=f'wss://{request.url.hostname}/media-stream?sms_from={sms_from}&caller_name={quote(caller_name)}')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -157,8 +182,9 @@ async def call_status(request: Request):
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     await websocket.accept()
-    sms_from = websocket.query_params.get('sms_from', '')
-    print(f"Media stream connected for {sms_from}")
+    sms_from    = websocket.query_params.get('sms_from', '')
+    caller_name = websocket.query_params.get('caller_name', 'your caller')
+    print(f"Media stream connected for {sms_from} (caller: {caller_name})")
 
     async with websockets.connect(
         "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
@@ -196,12 +222,13 @@ async def handle_media_stream(websocket: WebSocket):
                             sessions[sms_from]['stream_sid'] = stream_sid
                         print(f"Stream started: {stream_sid}")
                         # Play intro message to the voice user
-                        asyncio.create_task(inject_text_as_speech(
-                            openai_ws,
-                            "Hello. I am a voice assistant from TextCaller. "
-                            "I have your caller on the line. They are communicating "
-                            "via text message, which I will repeat to you."
-                        ))
+                        intro = (
+                            f"Hello. I am a voice assistant with WhisperText. "
+                            f"I have {caller_name} on the line for you. "
+                            f"They are communicating via text messages, which I will repeat aloud to you. "
+                            f"I will do my best to record what you say and text it back to them."
+                        )
+                        asyncio.create_task(inject_text_as_speech(openai_ws, intro))
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
