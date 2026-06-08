@@ -191,6 +191,13 @@ async def handle_media_stream(websocket: WebSocket):
                         if sms_from and sms_from in sessions:
                             sessions[sms_from]['stream_sid'] = stream_sid
                         print(f"Stream started: {stream_sid}")
+                        # Play intro message to the voice user
+                        asyncio.create_task(inject_text_as_speech(
+                            openai_ws,
+                            "Hello. I am a voice assistant from TextCaller. "
+                            "I have your caller on the line. They are communicating "
+                            "via text message, which I will repeat to you."
+                        ))
                     elif data['event'] == 'mark':
                         if mark_queue:
                             mark_queue.pop(0)
