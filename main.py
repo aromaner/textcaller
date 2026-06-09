@@ -5,6 +5,7 @@ import asyncio
 import audioop
 import httpx
 import websockets
+import redis
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -24,6 +25,7 @@ TWILIO_AUTH_TOKEN  = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE       = os.getenv('TWILIO_PHONE_NUMBER')
 PORT               = int(os.getenv('PORT', 5050))
 PUBLIC_URL         = os.getenv('PUBLIC_URL', '')
+REDIS_URL          = os.getenv('REDIS_URL', 'redis://localhost:6379')
 
 # Word threshold: responses longer than this get summarized
 SUMMARY_WORD_THRESHOLD = 20
@@ -31,7 +33,31 @@ SUMMARY_WORD_THRESHOLD = 20
 END_CALL_COMMANDS = {'end call', 'bye', 'goodbye', 'hang up', 'stop', 'end'}
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-sessions: dict = {}
+
+# ── Redis session helpers ──────────────────────────────────────────────────────
+# Redis stores serializable session metadata (voice_number, call_sid, flags).
+# asyncio TTS queues live in memory only (can't be serialized).
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+SESSION_TTL  = 3600  # 1 hour expiry
+
+# In-memory TTS queues keyed by from_number (survive within a single process)
+tts_queues: dict = {}
+
+def session_key(from_number: str) -> str:
+    return f"whispertext:session:{from_number}"
+
+def get_session(from_number: str) -> dict | None:
+    data = redis_client.get(session_key(from_number))
+    return json.loads(data) if data else None
+
+def save_session(from_number: str, session: dict):
+    # Don't store non-serializable objects
+    serializable = {k: v for k, v in session.items() if k != 'tts_queue'}
+    redis_client.setex(session_key(from_number), SESSION_TTL, json.dumps(serializable))
+
+def delete_session(from_number: str):
+    redis_client.delete(session_key(from_number))
+    tts_queues.pop(from_number, None)
 
 app = FastAPI()
 
@@ -39,7 +65,12 @@ app = FastAPI()
 # ── Health check ───────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        redis_client.ping()
+        redis_status = "ok"
+    except Exception:
+        redis_status = "unavailable"
+    return {"status": "ok", "redis": redis_status}
 
 
 # ── SMS Webhook (/sms) ─────────────────────────────────────────────────────────
@@ -50,22 +81,22 @@ async def handle_sms(request: Request):
     body        = form.get('Body', '').strip()
     body_lower  = body.lower()
 
-    resp = MessagingResponse()
+    resp    = MessagingResponse()
+    session = get_session(from_number)
 
     # ── Active call: relay text or end call ──
-    if from_number in sessions and sessions[from_number].get('active'):
-        session = sessions[from_number]
-
+    if session and session.get('active'):
         if body_lower in END_CALL_COMMANDS:
             try:
                 twilio_client.calls(session['call_sid']).update(status='completed')
             except Exception as e:
                 print(f"Error hanging up: {e}")
             session['active'] = False
+            save_session(from_number, session)
             resp.message("Call ended.")
             return HTMLResponse(content=str(resp), media_type="application/xml")
 
-        tts_queue = session.get('tts_queue')
+        tts_queue = tts_queues.get(from_number)
         if tts_queue is not None:
             await tts_queue.put(body)
         else:
@@ -74,8 +105,7 @@ async def handle_sms(request: Request):
         return HTMLResponse(content=str(resp), media_type="application/xml")
 
     # ── Pending name: user is providing their name ──
-    if from_number in sessions and sessions[from_number].get('awaiting_name'):
-        session      = sessions[from_number]
+    if session and session.get('awaiting_name'):
         caller_name  = body.strip()
         voice_number = session['voice_number']
         session['caller_name']   = caller_name
@@ -92,9 +122,10 @@ async def handle_sms(request: Request):
             )
             session['call_sid'] = call.sid
             session['active']   = True
+            save_session(from_number, session)
             resp.message(f"Calling {voice_number}... I'll let you know when they pick up. Start texting to speak. Reply 'end call' to hang up.")
         except Exception as e:
-            del sessions[from_number]
+            delete_session(from_number)
             resp.message(f"Failed to place call: {e}")
 
         return HTMLResponse(content=str(resp), media_type="application/xml")
@@ -109,15 +140,14 @@ async def handle_sms(request: Request):
         else:
             voice_number = '+1' + voice_number
 
-        sessions[from_number] = {
-            'voice_number': voice_number,
-            'call_sid':     None,
-            'stream_sid':   None,
-            'tts_queue':    None,
-            'active':       False,
+        save_session(from_number, {
+            'voice_number':  voice_number,
+            'call_sid':      None,
+            'stream_sid':    None,
+            'active':        False,
             'awaiting_name': True,
-            'caller_name':  None
-        }
+            'caller_name':   None
+        })
         resp.message(
             "We will place your call in a moment. First, enter the name for your "
             "voice assistant with WhisperText to use when announcing your call."
@@ -154,13 +184,16 @@ async def voice_connect(request: Request):
 # ── Call Status Webhook (/call-status) ────────────────────────────────────────
 @app.api_route("/call-status", methods=["GET", "POST"])
 async def call_status(request: Request):
-    form        = await request.form()
-    sms_from    = request.query_params.get('sms_from', '')
-    status      = form.get('CallStatus', 'unknown')
+    form     = await request.form()
+    sms_from = request.query_params.get('sms_from', '')
+    status   = form.get('CallStatus', 'unknown')
 
-    if sms_from and sms_from in sessions:
-        sessions[sms_from]['active'] = False
-        tts_queue = sessions[sms_from].get('tts_queue')
+    session = get_session(sms_from) if sms_from else None
+    if session:
+        session['active'] = False
+        save_session(sms_from, session)
+
+        tts_queue = tts_queues.get(sms_from)
         if tts_queue:
             await tts_queue.put(None)  # signal shutdown
 
@@ -190,8 +223,8 @@ async def handle_media_stream(websocket: WebSocket):
     stream_sid = None
     tts_queue  = asyncio.Queue()
 
-    if sms_from and sms_from in sessions:
-        sessions[sms_from]['tts_queue'] = tts_queue
+    if sms_from:
+        tts_queues[sms_from] = tts_queue
 
     # ── Deepgram STT connection ──
     dg_url = (
@@ -221,14 +254,14 @@ async def handle_media_stream(websocket: WebSocket):
 
                     if event == 'start':
                         stream_sid = data['start']['streamSid']
-                        if sms_from and sms_from in sessions:
-                            sessions[sms_from]['stream_sid'] = stream_sid
+                        session = get_session(sms_from)
+                        if session:
+                            session['stream_sid'] = stream_sid
+                            save_session(sms_from, session)
                         print(f"Stream started: {stream_sid}")
-                        # Play intro after a short delay to let stream stabilize
                         asyncio.create_task(play_intro(websocket, stream_sid, caller_name))
 
                     elif event == 'media':
-                        # Twilio sends mulaw 8kHz — forward directly to Deepgram
                         audio_bytes = base64.b64decode(data['media']['payload'])
                         await dg_ws.send(audio_bytes)
 
@@ -248,44 +281,47 @@ async def handle_media_stream(websocket: WebSocket):
         async def receive_from_deepgram():
             try:
                 async for message in dg_ws:
-                    data = json.loads(message)
-                    msg_type = data.get('type', '')
+                    data        = json.loads(message)
+                    msg_type    = data.get('type', '')
 
                     if msg_type == 'Results':
-                        alt = data.get('channel', {}).get('alternatives', [{}])[0]
+                        alt        = data.get('channel', {}).get('alternatives', [{}])[0]
                         transcript = alt.get('transcript', '').strip()
                         is_final   = data.get('is_final', False)
 
-                        if transcript and is_final:
-                            word_count = len(transcript.split())
+                        if not transcript or not is_final:
+                            continue
 
-                            if word_count > SUMMARY_WORD_THRESHOLD:
-                                # Summarize long response
-                                summary = await summarize(transcript)
-                                # Text the summary to the text user
-                                if sms_from:
-                                    try:
-                                        twilio_client.messages.create(
-                                            body=f"📞 {summary}",
-                                            from_=TWILIO_PHONE,
-                                            to=sms_from
-                                        )
-                                    except Exception as e:
-                                        print(f"Error sending summary SMS: {e}")
-                                # Read back confirmation to voice user
-                                readback = f"Ok, I'll tell {caller_name}: {summary}"
-                                await tts_queue.put(f"__READBACK__{readback}")
-                            else:
-                                # Short response — pass through as-is
-                                if sms_from:
-                                    try:
-                                        twilio_client.messages.create(
-                                            body=f"📞 {transcript}",
-                                            from_=TWILIO_PHONE,
-                                            to=sms_from
-                                        )
-                                    except Exception as e:
-                                        print(f"Error sending transcript SMS: {e}")
+                        word_count = len(transcript.split())
+                        session    = get_session(sms_from)
+
+                        if word_count > SUMMARY_WORD_THRESHOLD:
+                            summary = await summarize(transcript)
+                            caller_name_display = session.get('caller_name', 'Caller') if session else 'Caller'
+
+                            # Read back confirmation to voice user
+                            await tts_queue.put(f"__READBACK__Ok, I'll tell {caller_name_display}: {summary}")
+
+                            # Send summary to text user
+                            if sms_from:
+                                try:
+                                    twilio_client.messages.create(
+                                        body=f"[Summary] {summary}",
+                                        from_=TWILIO_PHONE,
+                                        to=sms_from
+                                    )
+                                except Exception as e:
+                                    print(f"Error sending summary SMS: {e}")
+                        else:
+                            if sms_from:
+                                try:
+                                    twilio_client.messages.create(
+                                        body=transcript,
+                                        from_=TWILIO_PHONE,
+                                        to=sms_from
+                                    )
+                                except Exception as e:
+                                    print(f"Error sending transcript SMS: {e}")
 
             except Exception as e:
                 print(f"Deepgram receive error: {e}")
@@ -295,8 +331,7 @@ async def handle_media_stream(websocket: WebSocket):
             while True:
                 text = await tts_queue.get()
                 if text is None:
-                    break  # shutdown signal
-                # Strip internal readback prefix if present
+                    break
                 if text.startswith("__READBACK__"):
                     text = text[len("__READBACK__"):]
                 if stream_sid:
@@ -311,7 +346,7 @@ async def handle_media_stream(websocket: WebSocket):
 
 # ── Play intro to voice user ───────────────────────────────────────────────────
 async def play_intro(websocket: WebSocket, stream_sid: str, caller_name: str):
-    await asyncio.sleep(1)  # let stream settle
+    await asyncio.sleep(1)
     intro = (
         f"Hello. I am a voice assistant with WhisperText. "
         f"I have {caller_name} on the line for you. "
@@ -323,7 +358,6 @@ async def play_intro(websocket: WebSocket, stream_sid: str, caller_name: str):
 
 # ── Deepgram Aura TTS → mulaw audio → Twilio ──────────────────────────────────
 async def speak_to_twilio(websocket: WebSocket, stream_sid: str, text: str):
-    """Convert text to speech via Deepgram Aura and stream to Twilio."""
     url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=linear16&sample_rate=8000"
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
@@ -338,20 +372,18 @@ async def speak_to_twilio(websocket: WebSocket, stream_sid: str, text: str):
                 async for chunk in response.aiter_bytes(chunk_size=4096):
                     audio_chunks += chunk
 
-        # Convert linear16 PCM → mulaw 8kHz for Twilio
         mulaw_audio = audioop.lin2ulaw(audio_chunks, 2)
 
-        # Send in 160-byte chunks (20ms frames at 8kHz mulaw)
         chunk_size = 160
         for i in range(0, len(mulaw_audio), chunk_size):
-            chunk = mulaw_audio[i:i + chunk_size]
+            chunk   = mulaw_audio[i:i + chunk_size]
             payload = base64.b64encode(chunk).decode('utf-8')
             await websocket.send_json({
-                "event": "media",
+                "event":     "media",
                 "streamSid": stream_sid,
-                "media": {"payload": payload}
+                "media":     {"payload": payload}
             })
-            await asyncio.sleep(0.02)  # pace at 20ms per frame
+            await asyncio.sleep(0.02)
 
     except Exception as e:
         print(f"TTS error: {e}")
@@ -359,7 +391,6 @@ async def speak_to_twilio(websocket: WebSocket, stream_sid: str, text: str):
 
 # ── GPT-4o-mini summarizer ─────────────────────────────────────────────────────
 async def summarize(transcript: str) -> str:
-    """Summarize a long transcript using GPT-4o-mini."""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -389,4 +420,4 @@ async def summarize(transcript: str) -> str:
             return data['choices'][0]['message']['content'].strip()
     except Exception as e:
         print(f"Summarize error: {e}")
-        return transcript  # fallback: return original if summarization fails
+        return transcript
