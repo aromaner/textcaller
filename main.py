@@ -78,8 +78,13 @@ async def health():
 @app.get("/debug-env")
 async def debug_env():
     import os
-    keys = [k for k in os.environ.keys() if "REDIS" in k or "RAILWAY" in k]
-    return {k: os.environ.get(k,"") for k in keys}
+    return {
+        "PROJECT_ID": os.environ.get("RAILWAY_PROJECT_ID",""),
+        "SERVICE_ID": os.environ.get("RAILWAY_SERVICE_ID",""),
+        "ENVIRONMENT_ID": os.environ.get("RAILWAY_ENVIRONMENT_ID",""),
+        "REDIS_URL": os.environ.get("REDIS_URL","NOT SET"),
+        "ALL_KEYS": list(os.environ.keys())
+    }
 
 # ── SMS Webhook (/sms) ─────────────────────────────────────────────────────────
 @app.api_route("/sms", methods=["GET", "POST"])
