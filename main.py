@@ -73,6 +73,14 @@ async def health():
     return {"status": "ok", "redis": redis_status}
 
 
+
+# ── Temp debug endpoint ────────────────────────────────────────────────────────
+@app.get("/debug-env")
+async def debug_env():
+    import os
+    keys = [k for k in os.environ.keys() if "REDIS" in k or "RAILWAY" in k]
+    return {k: os.environ[k][:20] + "..." if len(os.environ.get(k,"")) > 20 else os.environ.get(k,"") for k in keys}
+
 # ── SMS Webhook (/sms) ─────────────────────────────────────────────────────────
 @app.api_route("/sms", methods=["GET", "POST"])
 async def handle_sms(request: Request):
